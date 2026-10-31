@@ -31,7 +31,8 @@ const CFG = {
   asaasWebhookToken: E.ASAAS_WEBHOOK_TOKEN || "",
   // Regras do negócio
   gratis: Number(E.USOS_GRATIS || 3),
-  limiteDiario: Number(E.LIMITE_DIARIO_ASSINANTE || 40),
+  limiteDiario: Number(E.LIMITE_DIARIO_ASSINANTE || 120), // mensagens/dia do assinante
+  conversaGratis: Number(E.MENSAGENS_GRATIS || 25),     // mensagens de papo no grátis
   planos: {
     semana: { nome: "1 semana", valor: Number(E.PRECO_SEMANA || 9.9), dias: 7 },
     mes: { nome: "1 mês", valor: Number(E.PRECO_MES || 24.9), dias: 30 },
@@ -61,7 +62,7 @@ async function dbInit() {
 }
 function novoUser(phone) {
   return { phone, estado: "novo", maior: false, gratisUsados: 0, ate: 0, diaData: "", diaUsos: 0, voz: true,
-           asaasCliente: "", planoPendente: "", hist: [] };
+           asaasCliente: "", planoPendente: "", hist: [], turnos: 0, nome: "" };
 }
 async function getUser(phone) {
   if (!pool) return mem.users.get(phone) || novoUser(phone);
@@ -69,7 +70,7 @@ async function getUser(phone) {
   return r.rows[0] ? { ...novoUser(phone), ...r.rows[0].data } : novoUser(phone);
 }
 async function saveUser(u) {
-  u.hist = (u.hist || []).slice(-6); // guarda só as últimas trocas (sem imagens)
+  u.hist = (u.hist || []).filter(h => h && typeof h === "object").slice(-16); // últimas trocas (texto, sem imagens)
   if (!pool) return void mem.users.set(u.phone, u);
   await pool.query(`insert into xv_users(phone,data,updated_at) values($1,$2,now())
                     on conflict(phone) do update set data=$2, updated_at=now()`, [u.phone, u]);
@@ -128,32 +129,42 @@ async function enviarAudio(to, mp3) {
 // ============================================================
 //  IA
 // ============================================================
-const PERSONA = `Você é o XAVECO, o parceiro de conversa criado pelo Patrick (criador de conteúdo de São Paulo). Seu trabalho: ajudar a pessoa a mandar a mensagem certa pra quem ela está a fim — com humor, confiança e respeito.
+const PERSONA = `Você é o XAVECO — a IA do Patrick (criador de conteúdo de São Paulo), treinada no jeito dele de falar. Você conversa no WhatsApp com quem quer ajuda pra mandar a mensagem certa pra alguém que está a fim.
 
-Jeito: português do Brasil, gíria leve de SP, engraçado e direto, como um amigo que manja de conversa. Nada de texto de coach, nada de cafona.
+COMO VOCÊ CONVERSA (o mais humano possível):
+- É uma conversa de WhatsApp entre amigos, não um atendimento. Gíria leve de SP ("mano", "tá ligado", "fechou", "pô"), humor, confiança. Nada de "Claro! Aqui está", nada de lista, nada de tópico, nada de textão.
+- Responda em 1 a 3 balões curtos (cada um com 1–2 frases), como alguém digitando de verdade. Às vezes 1 balão basta.
+- Primeiro ENTENDA a situação: quem é a pessoa, de onde se conhecem, o que já rolou, o que ele quer (puxar assunto, chamar pra sair, reverter um vácuo...). Faça UMA pergunta por vez, só o que precisar. Se já der pra ajudar, ajuda — não interrogue à toa.
+- Quando fizer sentido, peça o print ("me manda o print da conversa que eu vejo o clima"). Print de perfil/story também serve pra puxar assunto.
+- Quando tiver contexto suficiente (ou receber um print), entregue A mensagem certa no campo "xaveco" — UMA mensagem, pronta pra copiar, com cara de WhatsApp real (minúsculas, natural, no máximo 1 emoji). Nos balões, explique rapidinho o porquê, como amigo ("ela deixou a deixa do rolê, aproveita", "não manda textão, deixa ela responder"). Comente o clima/interesse de forma natural se tiver print ("ela tá dando abertura, dá pra ir").
+- Se ele pedir outra versão (mais ousada, mais leve, mais engraçada), mande outra no "xaveco".
+- Lembre do que já foi conversado e continue a história (ex.: "e aí, ela respondeu?").
+- Se perguntarem se é robô/IA ou se é o Patrick mesmo: diga com leveza que é a IA do Patrick, treinada no jeito dele. Nunca afirme ser humano.
+- Se perguntarem como funciona/preço: ${"{"}PRODUTO${"}"}
 
 REGRAS (inegociáveis):
-- Nada de conteúdo sexual explícito, nudes, ou coisa pesada. "Ousada" = confiante e provocante, nunca vulgar.
-- Respeito sempre: se a outra pessoa disse não, pediu pra parar, bloqueou, ou claramente não quer papo, NÃO dê táticas pra insistir — diga com carinho pra respeitar e seguir a vida (campo "recusa").
+- Nada de conteúdo sexual explícito, nudes ou vulgaridade. Ousado = confiante, nunca apelativo.
+- Respeito: se a outra pessoa disse não, pediu pra parar, bloqueou ou claramente não quer, NÃO ajude a insistir — fale com carinho pra respeitar e seguir a vida.
 - Nada de manipulação, mentira, chantagem emocional, ciúme forçado ou humilhação.
-- Se houver qualquer sinal de que alguém na conversa é menor de idade, recuse (campo "recusa").
-- Não repita dados pessoais (telefone, endereço, sobrenome) que aparecerem no print.`;
+- Qualquer sinal de menor de idade na história → não ajude com xaveco.
+- Não repita dados pessoais (telefone, endereço, sobrenome) que aparecerem em prints.`;
 
-const FORMATO = `Responda SOMENTE um JSON válido neste formato:
+const FORMATO = `Responda SOMENTE um JSON válido:
 {
-  "tipo": "conversa" | "perfil" | "situacao" | "outro",
-  "opcoes": ["texto engraçado", "texto ousado (sem apelação)", "texto de boa/natural"],
-  "termometro": { "nota": 0-10, "motivo": "1 frase" } ou null,
-  "dica": "1 frase curta de estratégia",
-  "fala_audio": "comentário falado do Patrick, 1 a 2 frases, como se fosse áudio de amigo (ex: 'Mano, ela tá dando mole, manda a segunda que é sucesso')",
-  "recusa": null ou "mensagem curta e gentil explicando por que não vai ajudar"
+  "baloes": ["balão 1", "balão 2"],          // 1 a 3 mensagens curtas suas, na ordem
+  "xaveco": null ou "a mensagem pronta pra ele copiar e mandar",
+  "audio": null ou "o que você falaria num áudio de até 15 segundos (máx. ~35 palavras), no lugar dos balões",
+  "resumo_print": null ou "1 frase descrevendo o que tinha no print (pra você lembrar depois)"
 }
-- "conversa": print de conversa → 3 opções de PRÓXIMA mensagem que a pessoa deve mandar + termômetro (quanto o outro lado parece interessado).
-- "perfil": print de perfil/story/foto → 3 mensagens de ABERTURA criativas baseadas no que aparece (nada de "oi sumida"); termometro = null.
-- "situacao": a pessoa descreveu a situação por texto/áudio → 3 opções do que mandar; termometro só se der pra avaliar.
-- "outro": não dá pra entender / não tem nada a ver → opcoes = [], e use "dica" pra pedir o print ou explicar melhor.
-- Mensagens curtas, com cara de WhatsApp real (minúsculas, sem formalidade), no máximo 1 emoji cada.`;
+- Use "audio" quando a pessoa tiver mandado ÁUDIO (aí responda falando, natural, sem emoji). O áudio substitui os balões; se tiver xaveco, ele continua indo em texto separado pra copiar.
+- Se entregar um xaveco, o último balão (ou o fim do áudio) deve introduzir ele naturalmente ("manda essa aqui 👇").`;
 
+function promptSistema(u, extra) {
+  const s = CFG.planos.semana, m = CFG.planos.mes;
+  const produto = `o Xaveco ajuda a destravar conversa: a pessoa conta a situação por texto ou áudio, manda print se quiser, e recebe a mensagem certa. Tem ${CFG.gratis} xavecos grátis; depois é ${brl(s.valor)} a semana ou ${brl(m.valor)} o mês, no Pix (manda "assinar").`;
+  const status = assinante(u) ? "Quem está falando com você é ASSINANTE (ilimitado)." : `Quem está falando com você está no grátis: já recebeu ${u.gratisUsados} de ${CFG.gratis} xavecos.`;
+  return PERSONA.replace("{PRODUTO}", produto) + "\n\n" + FORMATO + `\n\n${status}${u.nome ? ` O nome dessa pessoa no WhatsApp é ${u.nome}.` : ""}${extra ? "\n" + extra : ""}`;
+}
 async function openai(messages, json = true) {
   let ultimo;
   for (const model of CFG.models) {
@@ -183,21 +194,24 @@ async function transcrever(buf, mime) {
   }
   return "";
 }
-async function xavecar(u, { texto, imagem }) {
-  const conteudo = [];
-  if (imagem) conteudo.push({ type: "image_url", image_url: { url: `data:${imagem.mime};base64,${imagem.buf.toString("base64")}` } });
-  conteudo.push({ type: "text", text: (imagem ? "Print enviado pela pessoa." : "") + (texto ? `\nO que a pessoa disse: "${texto}"` : "") });
-  const contexto = u.hist.length ? `\n\nContexto das últimas trocas com essa pessoa (pode ser a continuação da mesma história):\n${u.hist.map(h => "- " + h).join("\n")}` : "";
-  const raw = await openai([{ role: "system", content: PERSONA + "\n\n" + FORMATO + contexto }, { role: "user", content: conteudo }]);
-  let r; try { r = JSON.parse(raw); } catch { r = { tipo: "outro", opcoes: [], dica: "Não entendi bem 😅 Manda o print da conversa ou me conta a situação." }; }
-  r.opcoes = Array.isArray(r.opcoes) ? r.opcoes.filter(Boolean).slice(0, 3) : [];
+async function conversar(u, { texto, imagem, veioDeAudio }) {
+  const hist = (u.hist || []).filter(h => h && typeof h === "object").map(h => ({ role: h.r === "u" ? "user" : "assistant", content: h.t }));
+  const atual = [];
+  if (imagem) atual.push({ type: "image_url", image_url: { url: `data:${imagem.mime};base64,${imagem.buf.toString("base64")}` } });
+  atual.push({ type: "text", text: (imagem ? "[mandou um print]" : veioDeAudio ? "[mandou um ÁUDIO, transcrição]: " : "") + (texto ? (imagem ? " " : "") + texto : "") || "[mensagem vazia]" });
+  const raw = await openai([{ role: "system", content: promptSistema(u, veioDeAudio ? "A ÚLTIMA mensagem veio em áudio: responda no campo audio." : "") }, ...hist, { role: "user", content: atual }]);
+  let r; try { r = JSON.parse(raw); } catch { r = { baloes: [String(raw || "").slice(0, 300) || "Opa, me conta de novo? 😅"] }; }
+  r.baloes = (Array.isArray(r.baloes) ? r.baloes : [r.baloes]).filter(x => typeof x === "string" && x.trim()).slice(0, 3);
+  if (typeof r.xaveco !== "string" || !r.xaveco.trim()) r.xaveco = null;
+  if (typeof r.audio !== "string" || !r.audio.trim()) r.audio = null;
+  if (!r.baloes.length && !r.audio) r.baloes = [r.xaveco ? "manda essa aqui 👇" : "Me conta melhor a situação? 👀"];
   return r;
 }
 async function vozDoPatrick(texto) {
   if (!CFG.elevenKey || !CFG.elevenVoice || !texto) return null;
   const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${CFG.elevenVoice}?output_format=mp3_44100_64`, {
     method: "POST", headers: { "xi-api-key": CFG.elevenKey, "Content-Type": "application/json", Accept: "audio/mpeg" },
-    body: JSON.stringify({ text: texto.slice(0, 300), model_id: E.ELEVENLABS_MODEL || "eleven_multilingual_v2" }),
+    body: JSON.stringify({ text: texto.slice(0, 260), model_id: E.ELEVENLABS_MODEL || "eleven_multilingual_v2" }),
   });
   if (!r.ok) { log("ElevenLabs", r.status, await r.text()); return null; }
   return Buffer.from(await r.arrayBuffer());
@@ -232,15 +246,15 @@ async function gerarPix(u, plano) {
 //  FLUXO DA CONVERSA
 // ============================================================
 const assinante = u => u.ate > Date.now();
-const MENU = `Funciona assim 👇
-📸 *Print da conversa* → te dou 3 respostas + o termômetro (o quanto a pessoa tá a fim)
-👀 *Print do perfil/story* → 3 jeitos de puxar assunto
-🎙️ *Áudio ou texto* contando a situação → te digo o que mandar
+const MENU = `Tô aqui pra te ajudar a destravar a conversa 😏
+Me conta a situação (escrito ou áudio), manda o print da conversa ou do perfil, e eu te falo a mensagem certa.
 
 Comandos: *assinar* · *status* · *voz off* / *voz on*`;
+const espera = (to, txt) => to.startsWith("teste:") ? Promise.resolve() : new Promise(r => setTimeout(r, Math.min(700 + String(txt).length * 30, 3500)));
 
 async function aoReceber(phone, msg) {
   const u = await getUser(phone);
+  if (msg._nome && !u.nome) u.nome = String(msg._nome).split(" ")[0].slice(0, 30);
   const tipo = msg.type;
   const textoBruto = tipo === "text" ? (msg.text?.body || "").trim()
     : tipo === "interactive" ? (msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || "") : "";
@@ -249,7 +263,8 @@ async function aoReceber(phone, msg) {
   // 1) Primeiro contato → verificação de idade
   if (!u.maior) {
     if (t === "idade_sim") { u.maior = true; u.estado = "pronto"; await saveUser(u);
-      return enviarTexto(phone, `Fechou! 🤝 Aqui é o *Xaveco*, o parceiro do Patrick pra você nunca mais travar na conversa.\n\n${MENU}\n\nVocê tem *${CFG.gratis} xavecos grátis*. Manda o print aí 👇`); }
+      await enviarTexto(phone, `Fechou${u.nome ? ", " + u.nome : ""}! 🤝`); await espera(phone, "xx");
+      return enviarTexto(phone, "Aqui é o Xaveco, a IA do Patrick 😏 Me conta: qual é a situação? Pode mandar áudio, print, o que for."); }
     if (t === "idade_nao") { u.estado = "menor"; await saveUser(u);
       return enviarTexto(phone, "Valeu pela sinceridade! 🙏 O Xaveco é só pra maiores de 18. Volta aqui quando fizer 18 que a gente se fala."); }
     if (u.estado === "menor") return enviarTexto(phone, "O Xaveco é só pra maiores de 18 🙏");
@@ -258,8 +273,8 @@ async function aoReceber(phone, msg) {
   }
 
   // 2) Comandos
-  if (/^(menu|ajuda|help|oi+|ol[aá]|e a[ií]|eae|salve|bom dia|boa tarde|boa noite)\W*$/.test(t)) return enviarTexto(phone, MENU);
-  if (t === "voz off" || t === "voz on") { u.voz = t === "voz on"; await saveUser(u); return enviarTexto(phone, u.voz ? "🎙️ Áudio ligado!" : "🔇 Beleza, mando só texto."); }
+  if (/^(menu|ajuda|help|comandos)\W*$/.test(t)) return enviarTexto(phone, MENU);
+  if (t === "voz off" || t === "voz on") { u.voz = t === "voz on"; await saveUser(u); return enviarTexto(phone, u.voz ? "🎙️ Fechou, quando você mandar áudio eu respondo em áudio." : "🔇 Beleza, respondo só escrito."); }
   if (t === "status") {
     return enviarTexto(phone, assinante(u) ? `✅ Xaveco ilimitado até *${dataBR(u.ate)}*.`
       : `Você usou ${Math.min(u.gratisUsados, CFG.gratis)} de ${CFG.gratis} xavecos grátis. Manda *assinar* pra liberar ilimitado.`);
@@ -271,7 +286,7 @@ async function aoReceber(phone, msg) {
       return enviarTexto(phone, "Boa! 🔥 Pra gerar o Pix, o banco pede seu *CPF* (só números). Ele vai direto pro sistema de pagamento, eu não guardo."); }
     await saveUser(u); return mandarPix(u);
   }
-  if (u.estado === "cpf" && tipo === "text") {
+  if (u.estado === "cpf" && tipo === "text" && /^[\d.\-\s]{11,14}$/.test(t)) {
     const cpf = t.replace(/\D/g, "");
     if (!cpfValido(cpf)) return enviarTexto(phone, "Esse CPF não bateu 🤔 Manda de novo, só os 11 números. (Ou *cancelar*)");
     try {
@@ -280,56 +295,65 @@ async function aoReceber(phone, msg) {
       return mandarPix(u);
     } catch (e) { log(e.message); return enviarTexto(phone, "Deu ruim pra gerar o pagamento agora 😕 Tenta de novo em alguns minutos mandando *assinar*."); }
   }
-  if (t === "cancelar") { u.estado = "pronto"; await saveUser(u); return enviarTexto(phone, "Beleza, cancelado. Manda um print quando quiser 👊"); }
+  if (t === "cancelar") { u.estado = "pronto"; await saveUser(u); return enviarTexto(phone, "Beleza, cancelado 👊 Bora voltar pro xaveco?"); }
 
-  // 3) Pedido de xaveco (print, áudio ou texto descrevendo)
-  const ehPedido = tipo === "image" || tipo === "audio" || (tipo === "document" && /image/.test(msg.document?.mime_type || "")) || (tipo === "text" && textoBruto.length >= 12);
-  if (!ehPedido) return enviarTexto(phone, "Manda o *print* da conversa ou do perfil, ou um *áudio* contando a situação 👇");
+  // 3) Conversa (texto, áudio ou print)
+  const suportado = tipo === "text" || tipo === "image" || tipo === "audio" || (tipo === "document" && /image/.test(msg.document?.mime_type || ""));
+  if (!suportado) return enviarTexto(phone, "Esse tipo de mensagem eu não consigo ver 😅 Manda escrito, áudio ou print.");
+  if (u.estado === "cpf") { u.estado = "pronto"; } // mudou de assunto no meio do pagamento
 
   // cota
-  if (!assinante(u) && u.gratisUsados >= CFG.gratis) return oferecerPlanos(u, true);
+  if (!assinante(u) && (u.gratisUsados >= CFG.gratis || (u.turnos || 0) >= CFG.conversaGratis)) return oferecerPlanos(u, true);
   if (assinante(u)) {
     if (u.diaData !== hojeSP()) { u.diaData = hojeSP(); u.diaUsos = 0; }
-    if (u.diaUsos >= CFG.limiteDiario) return enviarTexto(phone, "Hoje já foi muito xaveco 😅 Seu limite do dia acabou — amanhã tem mais!");
+    if (u.diaUsos >= CFG.limiteDiario) return enviarTexto(phone, "Hoje já foi muito papo 😅 Seu limite do dia acabou, amanhã a gente continua!");
   }
 
   await marcarLidoDigitando(msg.id);
-  let r;
+  let r, texto = "", veioDeAudio = false, imagem = null;
   try {
-    let imagem = null, texto = tipo === "text" ? textoBruto : (msg.image?.caption || "");
+    texto = tipo === "text" ? textoBruto : (msg.image?.caption || msg.document?.caption || "");
     if (tipo === "image" || tipo === "document") imagem = msg._imagem || await baixarMidia((msg.image || msg.document).id);
     if (tipo === "audio") {
       const a = msg._audio || await baixarMidia(msg.audio.id);
       texto = msg._transcricao || await transcrever(a.buf, a.mime);
+      veioDeAudio = true;
       if (!texto) return enviarTexto(phone, "Não consegui ouvir o áudio 😕 Manda de novo ou escreve.");
     }
-    r = await xavecar(u, { texto, imagem });
+    r = await conversar(u, { texto, imagem, veioDeAudio });
   } catch (e) { log("Erro IA", e.message); return enviarTexto(phone, "Opa, deu uma travada aqui 😅 Manda de novo em 1 minutinho."); }
 
-  if (r.recusa) return enviarTexto(phone, r.recusa);
-  if (!r.opcoes.length) return enviarTexto(phone, r.dica || "Não entendi 😅 Manda o print da conversa ou me conta a situação.");
-
-  // conta o uso só quando entregou
-  if (assinante(u)) u.diaUsos++; else u.gratisUsados++;
-  u.hist.push(`${r.tipo}${texto_curto(r)}`);
+  // memória da conversa (sem guardar a imagem)
+  u.hist.push({ r: "u", t: imagem ? `[mandou um print${r.resumo_print ? ": " + r.resumo_print : ""}]${texto ? " " + texto : ""}` : (veioDeAudio ? "[áudio] " : "") + texto });
+  u.hist.push({ r: "a", t: (r.audio || r.baloes.join("\n")) + (r.xaveco ? `\n[sugeri a mensagem: "${r.xaveco}"]` : "") });
+  u.turnos = (u.turnos || 0) + 1;
+  if (assinante(u)) u.diaUsos++; else if (r.xaveco) u.gratisUsados++;
   await saveUser(u);
 
-  const rot = ["😂 engraçada", "😏 ousada", "😎 de boa"];
-  let cab = r.tipo === "perfil" ? "👀 *3 jeitos de puxar assunto*" : "🔥 *Xaveco pronto*";
-  if (r.termometro && typeof r.termometro.nota === "number") cab += `\n\n🌡️ *Termômetro: ${r.termometro.nota}/10*\n${r.termometro.motivo || ""}`;
-  cab += `\n\n${r.opcoes.map((_, i) => `${i + 1}️⃣ ${rot[i]}`).join(" · ")}\n_(mandei separado pra você copiar fácil 👇)_`;
-  await enviarTexto(phone, cab);
-  for (const o of r.opcoes) await enviarTexto(phone, o);
-  let fim = r.dica ? `💡 ${r.dica}` : "";
-  if (!assinante(u)) { const rest = CFG.gratis - u.gratisUsados; fim += rest > 0 ? `\n\n_${rest > 1 ? "Restam" : "Resta"} ${rest} xaveco${rest > 1 ? "s" : ""} grátis._` : "\n\n_Esse foi seu último xaveco grátis. Manda *assinar* pra liberar ilimitado._"; }
-  if (fim.trim()) await enviarTexto(phone, fim.trim());
-  if (u.voz && r.fala_audio) { const mp3 = await vozDoPatrick(r.fala_audio).catch(() => null); if (mp3) await enviarAudio(phone, mp3); }
+  // resposta: áudio (se veio áudio) ou balões de texto, com "digitando…" entre eles
+  let foiAudio = false;
+  if (veioDeAudio && u.voz) {
+    const mp3 = await vozDoPatrick(r.audio || r.baloes.join(" ")).catch(() => null);
+    if (mp3) { await enviarAudio(phone, mp3); foiAudio = true; }
+  }
+  if (!foiAudio) {
+    const baloes = r.baloes.length ? r.baloes : [r.audio];
+    for (let i = 0; i < baloes.length; i++) {
+      if (i > 0) { await marcarLidoDigitando(msg.id); await espera(phone, baloes[i]); }
+      await enviarTexto(phone, baloes[i]);
+    }
+  }
+  if (r.xaveco) { await espera(phone, r.xaveco); await enviarTexto(phone, r.xaveco); }
+
+  if (r.xaveco && !assinante(u)) {
+    const rest = CFG.gratis - u.gratisUsados;
+    if (rest === 0) { await espera(phone, "xxxxxxxxxxxx"); await enviarTexto(phone, "Ó, esse foi seu último xaveco grátis 😮‍💨 Se curtiu, manda *assinar* que eu libero ilimitado 🔓"); }
+  }
 }
-function texto_curto(r) { const o = r.opcoes[2] || r.opcoes[0] || ""; return o ? `: sugeri "${o.slice(0, 80)}"` : ""; }
 
 async function oferecerPlanos(u, acabou = false) {
   const s = CFG.planos.semana, m = CFG.planos.mes;
-  return enviarBotoes(u.phone, `${acabou ? "Seus xavecos grátis acabaram! 😮‍💨\n\n" : ""}🔓 *Xaveco ilimitado*\nPrint, perfil, áudio, termômetro — quantas vezes quiser.\n\n• ${s.nome}: *${brl(s.valor)}*\n• ${m.nome}: *${brl(m.valor)}* (melhor custo)\n\nPagamento no Pix, liberação na hora.`,
+  return enviarBotoes(u.phone, `${acabou ? "Pô, seus xavecos grátis acabaram 😮‍💨 Bora continuar?\n\n" : ""}🔓 *Xaveco ilimitado*\nPrint, perfil, áudio, termômetro — quantas vezes quiser.\n\n• ${s.nome}: *${brl(s.valor)}*\n• ${m.nome}: *${brl(m.valor)}* (melhor custo)\n\nPagamento no Pix, liberação na hora.`,
     [{ id: "plano_semana", titulo: `Semana ${brl(s.valor)}` }, { id: "plano_mes", titulo: `Mês ${brl(m.valor)}` }]);
 }
 async function mandarPix(u) {
